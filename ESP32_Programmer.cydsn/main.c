@@ -19,45 +19,53 @@ static uint8 en = 1;
 static uint8 io0 = 1;
 static uint32 baud = 115200;
 
-static uint32 timer = 0;
-static uint8 timer_end = 0;
+static uint32 en_delay_timer = 0;
+static uint8 en_delay_end = 0;
 
-static uint32 cdcTimer = 0;
+static uint32 cdc_timer = 0;
 
-CY_ISR_PROTO(MyISR);
+CY_ISR_PROTO(ISR_1kHz);
 
 /**************************************
  * Debug support facilities
  *************************************/
+#define Debug 1
+
 /* Debug Print */
 char dbuf[256];
 
-#define MONITOR(...)
-
+#if defined(Debug)
 #define DP(...)                                                                                                                            \
     {                                                                                                                                      \
         sprintf(dbuf, __VA_ARGS__);                                                                                                        \
         UART_KitProg_PutString(dbuf);                                                                                                      \
     }
+#else
+#define DP(...)
+#endif
 
+/**************************************
+ * Main
+ *************************************/
 int main(void) {
-    uint16 count;
+    uint16 count_rx_pc, count_rx_esp32;
     uint8 buffer[USBUART_BUFFER_SIZE + 1];
-    uint8 state;
+    uint8 line_changed, control_state;
     uint32 tmp_baud;
     uint8 tmp_en;
     uint16 readByte;
-    uint8 H, L;
+    uint8 H_byte, L_byte;
 
     /* Enable global interrupts. */
     CyGlobalIntEnable;
 
     /* Start components. */
-    isr_1_StartEx(MyISR);
+    isr_1_StartEx(ISR_1kHz);
     VDAC_33_Start();
     USBUART_Start(USBFS_DEVICE, USBUART_5V_OPERATION);
     UART_KitProg_Start();
     UART_ESP32_Start();
+    PWM_LED_Start();
 
     DP("\nUSB UART for ESP32\n");
 
@@ -71,99 +79,122 @@ int main(void) {
         }
 
         if (USBUART_GetConfiguration()) {
-            /* From PC to ESP32 */
+            // ----------------------------------------
+            // From PC to ESP32
+            // ----------------------------------------
             if (USBUART_DataIsReady()) {
-                if ((count = USBUART_GetAll(buffer))) {
-                    UART_ESP32_PutArray(buffer, count);
-                    buffer[count] = 0;
+                if ((count_rx_pc = USBUART_GetAll(buffer))) {
+                    UART_ESP32_PutArray(buffer, count_rx_pc);
+                    buffer[count_rx_pc] = 0;
                 }
             }
 
-            /* From ESP32 to PC */
-            for (count = 0; UART_ESP32_GetRxBufferSize() && count < USBUART_BUFFER_SIZE;) {
-                // buffer[count] = UART_ESP32_ReadRxData();
-                // buffer[count] = UART_ESP32_GetChar();
+            // ----------------------------------------
+            // From ESP32 to PC
+            // ----------------------------------------
+            for (count_rx_esp32 = 0; UART_ESP32_GetRxBufferSize() && count_rx_esp32 < USBUART_BUFFER_SIZE;) {
                 readByte = UART_ESP32_GetByte();
-                H = readByte >> 8;
-                L = readByte & 0xff;
-                // if (!H && L != 0xc2) {
-                if (!H) {
-                    buffer[count++] = L;
-                    MONITOR("%c",L);
+                H_byte = readByte >> 8;
+                L_byte = readByte & 0xff;
+                if (!H_byte) {
+                    buffer[count_rx_esp32++] = L_byte;
                 }
             }
-            state = USBUART_GetLineControl() & (USBUART_LINE_CONTROL_DTR | USBUART_LINE_CONTROL_RTS);
-            // if (count && !state) {
-            // if (count && !timer) {
-            if (count) {
+            if (count_rx_esp32) {
                 // Wait until ready to send.
-                cdcTimer = 100;
-                while (!USBUART_CDCIsReady() && cdcTimer) {
+                cdc_timer = 100;
+                while (!USBUART_CDCIsReady() && cdc_timer) {
                 }
                 if (USBUART_CDCIsReady()) {
-                    USBUART_PutData(buffer, count);
+                    USBUART_PutData(buffer, count_rx_esp32);
                 }
             }
 
             /* Check for Line settings change. */
-            if ((state = USBUART_IsLineChanged())) {
-                if ((state & USBUART_LINE_CODING_CHANGED)) {
+            if ((line_changed = USBUART_IsLineChanged())) {
+                if ((line_changed & USBUART_LINE_CODING_CHANGED)) {
                     if ((tmp_baud = USBUART_GetDTERate()) != baud) {
                         // baudrate is changed
                         baud = tmp_baud;
 
                         // Change clock freq. for UART_ESP32.
                         // UART_ESP32_Stop();
-                        UART_CLK_SetDividerValue(1.0 * BCLK__BUS_CLK__HZ / 8 / baud + 0.5);
+                        UART_CLK_SetDividerValue(1.0 * BCLK__BUS_CLK__HZ / 16 / baud + 0.5);
                         // UART_ESP32_Start();
                     }
                 }
 
-                if ((state & USBUART_LINE_CONTROL_CHANGED)) {
-                    // DTR/RTS is changed
-                    state = USBUART_GetLineControl() & (USBUART_LINE_CONTROL_DTR | USBUART_LINE_CONTROL_RTS);
-                    io0 = (state == USBUART_LINE_CONTROL_DTR) ? 0 : 1;
-                    tmp_en = (state == USBUART_LINE_CONTROL_RTS) ? 0 : 1;
-                    if (!en && tmp_en) { // Rising edge of EN is detected.
-                        timer = 150;     // Set timer to 15ms.
+                if (line_changed & USBUART_LINE_CONTROL_CHANGED) {
+                    control_state = USBUART_GetLineControl();
+
+                    // DTR and RTS are active-low.
+                    //  When DTR==true, IO0 should be LOW.
+                    //  When RTS==true,  EN should be LOW.
+                    io0 = !(control_state & USBUART_LINE_CONTROL_DTR);
+                    tmp_en = !(control_state & USBUART_LINE_CONTROL_RTS);
+
+                    /*
+                     * reset-to-bootloader sequence is as follows:
+                     *  IO0=HIGH, EN=HIGH : normal state
+                     *  IO0=HIGH, EN=LOW  : chip in reset
+                     *  IO0=LOW,  EN=HIGH : chip out of reset
+                     *  IO0=HIGH, EN=HIGH : back to normal state
+                     */
+
+                    if (!en && tmp_en) {
+                        // Rising edge of EN is detected.
+                        // EN should rise after IO0 is surely LOW and before IO0 will be HIGH.
+                        // Set delay timer to 40ms because IO0 will rise within 50ms in the shortest case.
+                        en_delay_timer = 40;
+
+                        LED_Reg_Write((!io0) ? 1 : 0);
                     }
                     en = tmp_en;
 
-                    if (timer) {
-                        // Timer is active, keep EN low.
-                        Control_Reg_Write(io0 << 1);
+                    if (en_delay_timer) {
+                        // Delay timer is active, set IO0 as it is and keep EN LOW.
+                        Control_Reg_Write((io0 << 1) | 0);
                     } else {
-                        // Timer is inactive, set IO0 and EN as they are.
+                        // Delay timer is inactive, set IO0 and EN as they are.
                         Control_Reg_Write((io0 << 1) | en);
                     }
                 }
 
-                state = USBUART_GetLineControl();
-                DP("%9ld baud, DTR(%4s) RTS(%4s)\r", baud, ((state & USBUART_LINE_CONTROL_DTR)) ? "HIGH" : "LOW",
-                   ((state & USBUART_LINE_CONTROL_RTS)) ? "HIGH" : "LOW");
+#if defined(Debug)
+                control_state = USBUART_GetLineControl();
+                DP("%9ld baud, DTR(%4s) RTS(%4s)\r", baud, ((control_state & USBUART_LINE_CONTROL_DTR)) ? "HIGH" : "LOW",
+                   ((control_state & USBUART_LINE_CONTROL_RTS)) ? "HIGH" : "LOW");
+#endif
             }
         }
 
-        if (timer_end) {
-            timer_end = 0;
-            // timer is ended, set IO0 and EN as they are.
+        if (en_delay_end) {
+            en_delay_end = 0;
+            // Delay timer is ended, set IO0 and EN as they are.
             Control_Reg_Write((io0 << 1) | en);
+#if defined(Debug)
             if (!io0) {
                 DP("\n\n*** Program start ***\n\n");
             }
+#endif
         }
     }
 }
 
-CY_ISR(MyISR) {
-    if (timer) {
-        timer--;
-        if (!timer) {
-            timer_end = 1;
+/**************************************
+ * Interrupt handlers
+ *************************************/
+// ISR for 1kHz (1 ms) timer
+CY_ISR(ISR_1kHz) {
+    if (en_delay_timer) {
+        en_delay_timer--;
+        if (!en_delay_timer) {
+            en_delay_end = 1;
         }
     };
-    if (cdcTimer) {
-        cdcTimer--;
+
+    if (cdc_timer) {
+        cdc_timer--;
     }
 }
 
